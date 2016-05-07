@@ -1,7 +1,7 @@
 import time
 from markdown2 import markdown
 
-BODY = '''\
+BODY = u'''\
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE en-export SYSTEM "http://xml.evernote.com/pub/evernote-export2.dtd">
 <en-export export-date="20160101T000000Z" application="Evernote/Windows" version="6.x">
@@ -25,9 +25,14 @@ class Editor(object):
         if not createDate is None: self.createDate = createDate
         if not updateDate is None: self.updateDate = updateDate
     def get_html(self, md = True):
-        return BODY.format({
-            'title': self.title,
-            'content': markdown(self.content) if md else self.content,
-            'createDate': self._get_format_date(self.createDate),
-            'updateDate': self._get_format_date(self.updateDate),})
+        return BODY.format(
+            title = self.title,
+            content = markdown(self.content) if md else self.content,
+            createDate = self._get_format_date(self.createDate),
+            updateDate = self._get_format_date(self.updateDate))
 
+if __name__ == '__main__':
+    content = '# Title'
+    with open('m.enex', 'w') as f:
+        c = Editor('Demo', content, time.time(), time.time()).get_html()
+        f.write(c)
