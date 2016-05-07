@@ -1,73 +1,52 @@
 #coding=utf8
-import sys, hashlib
-
+import sys, hashlib, re, time
 import evernote.edam.type.ttypes as Types
 import evernote.edam.notestore.NoteStore as NoteStore
-from Oauth import Oauth
-from Storage import Storage
 from evernote.api.client import EvernoteClient
 
-# * If you are international user, replace all the yinxiang with evernote
-
-SANDBOX = True
-SERVICE_HOST = 'sandbox.evernote.com'
-# SANDBOX = False
-# SERVICE_HOST = 'app.yinxiang.com' 
-
-# * If you are international user, replace all the yinxiang with evernote
+from oauth import Oauth
+from storage import Storage
 
 # You can get this from 'https://%s/api/DeveloperToken.action'%SERVICE_HOST >>
-SPECIAL_DEV_TOKEN = True
-DEV_TOKEN = 'S=s1:U=91eca:E=15be6680420:C=1548eb6d760:P=1cd:****************************************************'
-# SPECIAL_DEV_TOKEN = False
-# DEV_TOKEN = ''
+DEV_TOKEN = ''
 # In China it's https://app.yinxiang.com/api/DeveloperToken.action <<
 
-LOCAL_STORAGE = False
-
-class EvernoteController:
-    def __init__(self):
-        if DEV_TOKEN:
-            self.token = DEV_TOKEN
-        else:
-            self.token = Oauth(SANDBOX).oauth()
-
-        sys.stdout.write('Logging\r')
-        if SANDBOX:
+class EvernoteController(object):
+    def __init__(self, token, isSpecialToken = False, sandbox = False, isInternational = False):
+        self.token = token
+        if sandbox:
             self.client = EvernoteClient(token=self.token)
+        elif isInternational:
+            self.client = EvernoteClient(token=self.token, service_host='app.evernote.com')
         else:
-            self.client = EvernoteClient(token=self.token, service_host=SERVICE_HOST)
+            self.client = EvernoteClient(token=self.token, service_host='app.yinxiang.com')
+        self.isSpecialToken = isSpecialToken
         self.userStore = self.client.get_user_store()
         self.noteStore = self.client.get_note_store()
-        if LOCAL_STORAGE: self.__set_storage()
-        print 'Login Succeed as ' + self.userStore.getUser().username
-    def __set_storage(self):
-        print 'Loading Storage'
-        self.storage = Storage(self.noteStore, self.token)
-        print 'Storage loaded'
-    def create_notebook(self,title):
+        self.storage = Storage(self.token, self.noteStore)
+    def create_notebook(self, title):
+        if self.get(title): return False
         notebook = Types.Notebook()
         notebook.name = title
         notebook = self.noteStore.createNotebook(notebook)
-        if LOCAL_STORAGE: self.storage.create_notebook(notebook)
-        print_line('Created notebook: %s successfully'%title)
-    def create_note(self, title, content, notebook = None, fileDir = None):
+        self.storage.create_notebook(notebook)
+        return True
+    def create_note(self, title, notebook = None, content = None, fileDir = None):
+        if self.get('%s/%s'%(notebook or self.storage.defaultNotebook, title)): return False
         note = Types.Note()
         note.title = title
         note.content = '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE en-note SYSTEM "http://xml.evernote.com/pub/enml2.dtd">'
         note.content += '<en-note>'
-        note.content += content
-        if notebook: note.notebookGuid = self.myfile(notebook).guid
+        note.content += content or ''
+        if notebook: note.notebookGuid = self.get(notebook).guid
         if not fileDir is None:
-            with open(fileDir, 'rb') as f:
-                fileBytes = f.read()
-                fileName = f.name
+            with open(fileDir, 'rb') as f: fileBytes = f.read()
             fileData = Types.Data()
             fileData.bodyHash = self._md5(fileBytes)
             fileData.size = len(fileBytes)
             fileData.body = fileBytes
             fileAttr = Types.ResourceAttributes()
-            fileAttr.fileName = fileName
+            fileAttr.fileName = title + '.md'
             fileAttr.attachment = True
             fileResource = Types.Resource()
             fileResource.data = fileData
@@ -77,76 +56,87 @@ class EvernoteController:
             note.content += '<en-media type="application/octet-stream" hash="%s"/>'%fileData.bodyHash
         note.content += '</en-note>'
         note = self.noteStore.createNote(note)
-        if LOCAL_STORAGE: self.storage.create_note(note, notebook)
-        print_line('Created note: %s successfully' %title)
-    def get_note(self, note):
-        note = self.myfile(note)
-        with open(note.resources[0].attributes.fileName, 'wb') as f: f.write(self.noteStore.getResourceData(note.resources[0].guid))
+        self.storage.create_note(note, notebook)
+        return True
+    def update_note(self, title, notebook = None, content = None, fileDir = None):
+        note = self.get('%s/%s'%(notebook or self.storage.defaultNotebook, title))
+        if note is None: return self.create_note(title, notebook, content or '', fileDir)
+        try:
+            header, oldContent = re.compile('(.*?)<en-note>(.*?)</en-note>').findall(note.content)[0]
+        except:
+            header = '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE en-note SYSTEM "http://xml.evernote.com/pub/enml2.dtd">'
+            oldContent = ''
+        guid = note.guid
+        oldContent = re.sub('<en-media.*?/>', '', oldContent)
+        note = Types.Note()
+        note.guid = guid
+        note.title = title
+        note.content = header
+        note.content += '<en-note>'
+        note.content += content or oldContent
+        if not fileDir is None:
+            with open(fileDir, 'rb') as f: fileBytes = f.read()
+            fileData = Types.Data()
+            fileData.bodyHash = self._md5(fileBytes)
+            fileData.size = len(fileBytes)
+            fileData.body = fileBytes
+            fileAttr = Types.ResourceAttributes()
+            fileAttr.fileName = title + '.md'
+            fileAttr.attachment = True
+            fileResource = Types.Resource()
+            fileResource.data = fileData
+            fileResource.mime = 'application/octet-stream'
+            fileResource.attributes = fileAttr
+            note.resources = [fileResource]
+            note.content += '<en-media type="application/octet-stream" hash="%s"/>'%fileData.bodyHash
+        note.content += '</en-note>'
+        self.noteStore.updateNote(self.token, note)
+        self.storage.delete_note('%s/%s'%(notebook or self.storage.defaultNotebook, title))
+        self.storage.create_note(note, notebook)
+        return True
+    def get_attachment(self, note):
+        note = self.get(note)
+        return (self.noteStore.getResourceData(resource.guid) for resource in note.resources)
     def move_note(self, note, _to):
-        if type(self.myfile(note)) != type(Types.Note()) or type(self.myfile(_to)) != type(Types.Notebook()): raise Exception('Type Error')
-        self.noteStore.copyNote(self.token, self.myfile(note).guid, self.myfile(_to).guid)
-        if SPECIAL_DEV_TOKEN:
-            self.noteStore.expungeNote(self.token, self.myfile(note).guid)
+        if self.get(note) is None: return False
+        if type(self.get(note)) != type(Types.Note()) or type(self.get(_to)) != type(Types.Notebook()): raise Exception('Type Error')
+        self.noteStore.copyNote(self.token, self.get(note).guid, self.get(_to).guid)
+        if self.isSpecialToken:
+            self.noteStore.expungeNote(self.token, self.get(note).guid)
         else:
-            self.noteStore.deleteNote(self.token, self.myfile(note).guid)
-        if LOCAL_STORAGE: self.storage.move_note(note, _to)
-        print_line('Move %s to %s successfully'%(note,_to))
+            self.noteStore.deleteNote(self.token, self.get(note).guid)
+        self.storage.move_note(note, _to)
+        return True
     def delete_note(self, note):
-        if type(self.myfile(note)) != type(Types.Note()): raise Exception('Types Error')
-        self.noteStore.deleteNote(self.token, self.myfile(note).guid)
-        # BUG
-        if LOCAL_STORAGE: self.storage.delete_note(note)
-        print_line('Deleted %s successfully'%note)
+        if self.get(note): return False
+        if type(self.get(note)) != type(Types.Note()): raise Exception('Types Error')
+        if self.isSpecialToken:
+            self.noteStore.expungeNote(self.token, self.get(note).guid)
+        else:
+            self.noteStore.deleteNote(self.token, self.get(note).guid)
+        self.storage.delete_note(note)
+        return True
     def delete_notebook(self, notebook):
-        if SPECIAL_DEV_TOKEN:
-            if type(self.myfile(notebook)) != type(Types.Notebook()): raise Exception('Types Error')
-            self.noteStore.expungeNotebook(self.token, self.myfile(notebook).guid)
-            # BUG
-            if LOCAL_STORAGE: self.storage.delete_notebook(notebook)
-            print_line('Deleted %s successfully'%notebook)
-    def myfile(self, s):
-        if LOCAL_STORAGE: return self.storage.myfile(s)
-        f = s.split('/')
-        if '/' in s:
-            for nb in self.noteStore.listNotebooks():
-                if nb.name == f[0]:
-                    fi = NoteStore.NoteFilter()
-                    fi.notebookGuid = nb.guid
-                    for ns in self.noteStore.findNotes(self.token, fi, 0, 999).notes:
-                        if ns.title == f[1]: return ns
-        else:
-            for nb in self.noteStore.listNotebooks():
-                if nb.name == f[0]: return nb
-        raise Exception('%s not found'%s)
+        if self.get(notebook) or not self.isSpecialToken: return False
+        if type(self.get(notebook)) != type(Types.Notebook()): raise Exception('Types Error')
+        self.noteStore.expungeNotebook(self.token, self.get(notebook).guid)
+        self.storage.delete_note(note)
+        return True
+    def get(self, s):
+        return self.storage.get(s)
     def show_notebook(self):
-        if LOCAL_STORAGE: 
-            self.storage.show_notebook()
-        else:
-            for nb in self.noteStore.listNotebooks(): print_line(nb.name)
+        self.storage.show_notebook()
     def show_notes(self, notebook=None):
-        if LOCAL_STORAGE:
-            self.storage.show_notes(notebook)
-        else:
-            for nb in self.noteStore.listNotebooks():
-                if not notebook: print_line(nb.name + ':')
-                if not notebook or nb.name == notebook:
-                    f = NoteStore.NoteFilter()
-                    f.notebookGuid = nb.guid
-                    for ns in self.noteStore.findNotes(self.token, f, 0, 999).notes:
-                        print_line(('' if notebook else '    ') + ns.title)
+        self.storage.show_notes(notebook)
     def _md5(self, s):
         m = hashlib.md5()
         m.update(s)
         return m.hexdigest()
 
-def print_line(s):
-    t = sys.getfilesystemencoding()
-    print s.decode('UTF-8').encode(t)
-
 if __name__ == '__main__':
-    e = EvernoteController()
-    # e.create_note('Hello', 'Hello, world!', 'Test', 't.md')
-    e.get_note('Test/Hello')
+    token = DEV_TOKEN
+    e = EvernoteController(token, True, True)
+    e.update_note('Hello', 'Test', 'Changed', 'README.md')
 
 if False:
     e.create_notebook('Notebook1')
